@@ -1,0 +1,8 @@
+{
+  "threads": 2,
+  "energy_threshold": 0.008,
+  "silence_ms": 650,
+  "preview_seconds": 1.1,
+  "max_sentence_seconds": 10,
+  "unload_seconds": 90
+}

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "selected_model": "sensevoice",
+  "offline_only": true,
+  "allow_downloads": false,
+  "allow_update_checks": false,
+  "allow_remote_transcription": false,
+  "allow_servers": false,
+  "allow_telemetry": false,
+  "require_dedicated_python": true,
+  "require_firewall": true
+}
