@@ -18,7 +18,7 @@ out.mkdir()
 def copy(source,destination):
     if source.is_symlink() or source.is_junction():raise ValueError('Linked files are not accepted in release input')
     destination.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(source,destination)
-for name in ('dictation_app.py','dictation_worker.py','session_buffer.py','private_clipboard.py','settings.json'):
+for name in ('dictation_app.py','dictation_worker.py','session_buffer.py','private_clipboard.py','caps_state.py','settings.json'):
     copy(ROOT/'app'/name,out/'app'/name)
 for name in ('inference_guard.py','offline_policy.py','lock-network.ps1'):
     copy(ROOT/'scripts'/name,out/'scripts'/name)

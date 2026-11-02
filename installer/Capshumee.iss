@@ -1,4 +1,4 @@
-﻿#define AppVersion "1.0.0"
+﻿#define AppVersion "1.0.1"
 #define Payload "..\.payload"
 [Setup]
 AppId={{18B62C4A-9C6F-4B3F-B0B1-E6B0CF68B344}
