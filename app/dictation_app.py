@@ -22,6 +22,7 @@ from inference_guard import audit
 from dictation_worker import encode_command
 from session_buffer import SessionBuffer
 from private_clipboard import PrivateClipboard
+from caps_state import CapsState
 
 user = C.WinDLL('user32', use_last_error=True)
 kernel = C.WinDLL('kernel32', use_last_error=True)
@@ -227,9 +228,9 @@ class App:
     def __init__(self, test_mode=False):
         require_dedicated_host()
         self.test_mode=test_mode;self.enabled=True;self.recording=False;self.ready=False
-        self.closing=False;self.session=0;self.session_buffer=SessionBuffer();self.caps_down=False
+        self.closing=False;self.session=0;self.session_buffer=SessionBuffer()
         self.clipboard_copy_failed=False
-        self.caps_state=bool(user.GetKeyState(0x14)&1)
+        self.caps=CapsState()
         self.status='正在准备本地识别…';self.preview='';self.hide_at=0;self.error=False
         self.inbox=queue.Queue();self.outbox=queue.Queue(maxsize=300)
         self.hook=None;self.process=None;self.dropped=False
@@ -270,7 +271,7 @@ class App:
         if not test_mode:
             self.hook=user.SetWindowsHookExW(13,self.hookproc,instance,0)
             if not self.hook:raise OSError('CAPS_HOOK')
-        user.SetTimer(self.hwnd,1,200,None)
+        if not user.SetTimer(self.hwnd,1,100,None):raise OSError('CAPS_TIMER')
 
     def send(self, kind, session=0, payload=b''):
         try:self.outbox.put_nowait(encode_command(kind,session,payload))
@@ -308,11 +309,19 @@ class App:
         if code>=0:
             key=C.cast(lp,C.POINTER(KBD)).contents
             if key.vkCode==0x14:
-                if wp in (0x100,0x104) and not self.caps_down:
-                    self.caps_down=True;self.caps_state=not self.caps_state
-                    user.PostMessageW(self.hwnd,WM_CAPS,int(self.caps_state),0)
-                elif wp in (0x101,0x105):self.caps_down=False
+                # The callback precedes Windows updating keyboard state.
+                # Only request a later check; never infer ON/OFF from a count.
+                user.PostMessageW(self.hwnd,WM_CAPS,0,0)
         return user.CallNextHookEx(self.hook,code,wp,lp)
+
+    def check_caps(self):
+        if self.test_mode or self.closing:return
+        available=self.enabled and self.ready and not self.error and bool(user.GetForegroundWindow())
+        on=bool(user.GetKeyState(0x14)&1)
+        held=bool(user.GetAsyncKeyState(0x14)&0x8000)
+        action=self.caps.sample(on,held,available,self.recording,time.monotonic())
+        if action=='stop':self.stop()
+        elif action=='start':self.start()
 
     def show(self, seconds=0):
         area=W.RECT();user.SystemParametersInfoW(48,0,C.byref(area),0)
@@ -329,6 +338,9 @@ class App:
 
     def start(self):
         if self.recording or not self.enabled:return
+        # Recheck at the actual microphone-open boundary, not just the event.
+        if not self.test_mode and (not user.GetForegroundWindow() or
+                not user.GetKeyState(0x14)&1 or user.GetAsyncKeyState(0x14)&0x8000):return
         if not self.ready or self.error:
             self.status='识别器尚未就绪，请稍后再按 Caps Lock';self.show(4);return
         if not self.clipboard.clear_previous():
@@ -345,6 +357,8 @@ class App:
             self.status='无法打开麦克风：请检查默认输入设备及麦克风权限'
             self.show(8);return
         self.recording=True
+        if not self.test_mode and (not user.GetForegroundWindow() or not user.GetKeyState(0x14)&1):
+            self.stop();return
         self.status='● 正在录音 · Caps Lock 熄灭即停止'
         self.preview='边说边预览，停顿后输入当前窗口'
         self.show();self.update_tray()
@@ -412,7 +426,7 @@ class App:
         command=user.TrackPopupMenu(menu,0x100|0x2,point.x,point.y,0,self.hwnd,None)
         user.DestroyMenu(menu);user.PostMessageW(self.hwnd,0,0,0)
         if command==101:
-            self.stop();self.enabled=not self.enabled;self.update_tray()
+            self.stop();self.caps.reset();self.enabled=not self.enabled;self.update_tray()
         elif command==102:self.send('U')
         elif command==103:
             try:set_startup(not startup_enabled())
@@ -444,8 +458,8 @@ class App:
     def window_proc(self, hwnd, message, wp, lp):
         try:
             if message==WM_CAPS:
-                if wp:self.start()
-                else:self.stop()
+                # Deferring also allows foreground input queues to catch up.
+                user.SetTimer(self.hwnd,2,25,None)
                 return 0
             if message==WM_WIM_DATA:
                 self.audio.data(lp);return 0
@@ -458,7 +472,11 @@ class App:
                 if hasattr(self,'font'):self.paint();return 0
             if message==0x14:return 1
             if message==0x21:return 3  # MA_NOACTIVATE: preview never steals the caret.
+            if message==0x218 and wp in (4,7,18):  # suspend / resume
+                self.caps.reset();self.stop();return 1
             if message==0x113:
+                if wp==2:user.KillTimer(self.hwnd,2)
+                self.check_caps()
                 if self.recording and not self.session_buffer.fallback and focus_target()!=self.session_buffer.target:
                     self.session_buffer.target_changed()
                     self.status='目标已切换 · 本轮结果仅暂存'
@@ -483,6 +501,7 @@ class App:
         self.update_tray()
         if not self.test_mode:shell.Shell_NotifyIconW(2,C.byref(self.nid))
         user.KillTimer(self.hwnd,1)
+        user.KillTimer(self.hwnd,2)
         self.send('Q')
         try:self.outbox.put_nowait(None)
         except queue.Full:pass
