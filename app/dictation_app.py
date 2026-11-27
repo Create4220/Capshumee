@@ -20,7 +20,10 @@ sys.path.insert(0, str(ROOT/'app'))
 from offline_policy import require_dedicated_host
 from inference_guard import audit
 from dictation_worker import encode_command
-from session_buffer import SessionBuffer
+from draft_session import DraftSession
+from preference_store import PreferenceStore
+from floating_editor import FloatingEditor, VocabularyWindow
+import tempfile
 from private_clipboard import PrivateClipboard
 from caps_state import CapsState
 
@@ -113,7 +116,6 @@ api(user,'FillRect',C.c_int,[W.HDC,C.POINTER(W.RECT),W.HBRUSH])
 api(user,'DrawTextW',C.c_int,[W.HDC,W.LPCWSTR,C.c_int,C.POINTER(W.RECT),W.UINT])
 api(user,'SystemParametersInfoW',W.BOOL,[W.UINT,W.UINT,C.c_void_p,W.UINT])
 api(user,'MessageBoxW',C.c_int,[W.HWND,W.LPCWSTR,W.LPCWSTR,W.UINT])
-api(user,'SendInput',W.UINT,[W.UINT,C.POINTER(INPUT),C.c_int])
 api(user,'RegisterWindowMessageW',W.UINT,[W.LPCWSTR])
 api(shell,'Shell_NotifyIconW',W.BOOL,[W.DWORD,C.POINTER(NID)])
 api(gdi,'CreateSolidBrush',W.HBRUSH,[W.DWORD])
@@ -154,28 +156,6 @@ def set_startup(enabled):
             try:winreg.DeleteValue(key,RUN_NAME)
             except FileNotFoundError:pass
 
-def focus_target():
-    foreground = user.GetForegroundWindow()
-    info = GUITHREAD();info.cbSize=C.sizeof(info)
-    tid = user.GetWindowThreadProcessId(foreground,None) if foreground else 0
-    focus = info.hwndFocus if tid and user.GetGUIThreadInfo(tid,C.byref(info)) else None
-    return foreground, focus
-
-def insert_text(text, target):
-    if not text:
-        return True
-    if not target[0] or focus_target() != target:
-        return False
-    if any(user.GetAsyncKeyState(vk)&0x8000 for vk in (0x10,0x11,0x12,0x5B,0x5C)):
-        return False
-    units = struct.unpack('<'+'H'*(len(text.encode('utf-16-le'))//2),text.encode('utf-16-le'))
-    inputs = (INPUT*(len(units)*2))()
-    for i,unit in enumerate(units):
-        for release in (0,1):
-            item=inputs[2*i+release];item.type=1
-            item.ki=KEYBDINPUT(0,unit,4|(2 if release else 0),0,0)
-    # Single batch prevents other key events interleaving inside a sentence.
-    return user.SendInput(len(inputs),inputs,C.sizeof(INPUT)) == len(inputs)
 
 class Audio:
     def __init__(self, owner):
@@ -228,7 +208,7 @@ class App:
     def __init__(self, test_mode=False):
         require_dedicated_host()
         self.test_mode=test_mode;self.enabled=True;self.recording=False;self.ready=False
-        self.closing=False;self.session=0;self.session_buffer=SessionBuffer()
+        self.closing=False;self.session=0;self.draft=DraftSession();self.editor=None;self.vocabulary=None
         self.clipboard_copy_failed=False
         self.caps=CapsState()
         self.status='正在准备本地识别…';self.preview='';self.hide_at=0;self.error=False
@@ -241,11 +221,17 @@ class App:
         wc.lpszClassName=self.classname;wc.hCursor=user.LoadCursorW(None,C.c_void_p(32512))
         if not user.RegisterClassW(C.byref(wc)) and C.get_last_error()!=1410:
             raise OSError('WINDOW_CLASS')
-        self.hwnd=user.CreateWindowExW(0x08000000|0x80|0x8,self.classname,APP_NAME,0x80000000,0,0,470,142,None,None,instance,None)
+        self.hwnd=user.CreateWindowExW(0x08010088,self.classname,APP_NAME,0x02CF0000,0,0,570,560,None,None,instance,None)
         if not self.hwnd:raise OSError('WINDOW_CREATE')
         self.audio=Audio(self)
         self.clipboard=PrivateClipboard(self.hwnd)
         self.font=gdi.CreateFontW(-18,0,0,0,400,0,0,0,1,0,0,5,0,'Microsoft YaHei UI')
+        self.test_preferences=tempfile.TemporaryDirectory(prefix='capshumee-test-') if test_mode else None
+        preference_path=Path(self.test_preferences.name)/'preferences.json' if test_mode else None
+        self.preferences=PreferenceStore(preference_path)
+        self.learn_jobs=queue.Queue(maxsize=32)
+        self.editor=FloatingEditor(self)
+        self.vocabulary=VocabularyWindow(self,sys.modules[__name__])
         self.nid=NID();self.nid.cbSize=C.sizeof(self.nid);self.nid.hWnd=self.hwnd
         self.nid.uID=1;self.nid.uFlags=1|2|4;self.nid.uCallbackMessage=WM_TRAY
         self.small_icon=user.LoadImageW(None,str(ROOT/'assets/capshumee.ico'),1,16,16,0x10)
@@ -266,6 +252,8 @@ class App:
             cwd=ROOT,creationflags=0x08000000,bufsize=0)
         sys.addaudithook(audit)
         threading.Thread(target=self.writer,daemon=True).start()
+        self.learning_thread=threading.Thread(target=self.learn_preferences,daemon=True)
+        self.learning_thread.start()
         threading.Thread(target=self.reader,daemon=True).start()
         self.send('H',0,self.token.encode('ascii'))
         if not test_mode:
@@ -324,10 +312,12 @@ class App:
         elif action=='start':self.start()
 
     def show(self, seconds=0):
-        area=W.RECT();user.SystemParametersInfoW(48,0,C.byref(area),0)
-        user.SetWindowPos(self.hwnd,W.HWND(-1),area.right-490,area.bottom-165,470,142,0x10)
+        if self.editor and not self.editor.positioned:
+            area=W.RECT();user.SystemParametersInfoW(48,0,C.byref(area),0)
+            width=min(570,area.right-area.left);height=min(560,area.bottom-area.top)
+            user.SetWindowPos(self.hwnd,W.HWND(-1),area.right-width-18,area.bottom-height-18,width,height,0x10)
+            self.editor.positioned=True
         user.ShowWindow(self.hwnd,4)
-        self.hide_at=time.monotonic()+seconds if seconds else 0
         user.InvalidateRect(self.hwnd,None,False)
 
     def update_tray(self):
@@ -338,35 +328,30 @@ class App:
 
     def start(self):
         if self.recording or not self.enabled:return
-        # Recheck at the actual microphone-open boundary, not just the event.
         if not self.test_mode and (not user.GetForegroundWindow() or
                 not user.GetKeyState(0x14)&1 or user.GetAsyncKeyState(0x14)&0x8000):return
+        if self.draft.active:
+            self.status='请先复制或取消当前草稿，再关灯、开灯录音';self.show();return
         if not self.ready or self.error:
-            self.status='识别器尚未就绪，请稍后再按 Caps Lock';self.show(4);return
+            self.status='识别器尚未就绪，请稍后再按 Caps Lock';self.show();return
         if not self.clipboard.clear_previous():
-            self.status='剪贴板被占用，请稍后重新按 Caps Lock';self.show(5);return
-        self.session+=1;self.preview='';self.dropped=False
-        self.clipboard_copy_failed=False
-        self.session_buffer.begin(self.session,focus_target())
+            self.status='剪贴板被占用，请稍后重新按 Caps Lock';self.show();return
+        self.session+=1;self.preview='';self.dropped=False;self.clipboard_copy_failed=False
+        self.draft.begin(self.session);self.editor.set_text('');self.editor.editable(False)
         self.send('S',self.session)
-        try:
-            self.audio.start(self.session)
+        try:self.audio.start(self.session)
         except OSError:
-            self.session_buffer.stopping(self.session,True)
-            self.send('E',self.session)
-            self.status='无法打开麦克风：请检查默认输入设备及麦克风权限'
-            self.show(8);return
+            self.send('E',self.session);self.draft.cancel()
+            self.status='无法打开麦克风：请检查默认输入设备及麦克风权限';self.show();return
         self.recording=True
         if not self.test_mode and (not user.GetForegroundWindow() or not user.GetKeyState(0x14)&1):
             self.stop();return
-        self.status='● 正在录音 · Caps Lock 熄灭即停止'
-        self.preview='边说边预览，停顿后输入当前窗口'
+        self.status='● 正在录音 · 文字仅显示在这里'
         self.show();self.update_tray()
 
     def stop(self):
         if not self.recording:return
         self.audio.stop();self.recording=False
-        self.session_buffer.stopping(self.session,focus_target()==self.session_buffer.target)
         self.send('E',self.session)
         self.status='已停止录音，正在整理最后一句…'
         self.show();self.update_tray()
@@ -375,53 +360,50 @@ class App:
         while True:
             try:message=self.inbox.get_nowait()
             except queue.Empty:break
-            kind=message.get('kind')
+            kind=message.get('kind');session=message.get('session')
             if kind=='ready':
                 self.ready=True;self.status='已就绪 · Caps Lock 亮起开始录音'
             elif kind in ('partial','final'):
-                if self.error:continue
-                text=message.get('text','');session=message.get('session')
-                if not self.session_buffer.accepts(session):continue
-                if session==self.session:
-                    self.preview=text[-180:];user.InvalidateRect(self.hwnd,None,False)
-                if kind=='final' and text:
-                    outcome=self.session_buffer.final(session,text,insert_text)
-                    if outcome=='fallback':
-                        self.status='本轮已暂存 · 停止后右键托盘复制'
-                        self.preview=self.session_buffer.text[-180:];self.show()
-                    elif outcome=='inserted' and not self.recording:
-                        self.status='已输入 · 麦克风已关闭';self.show(3)
-            elif kind=='stopped' and not self.recording and message.get('session')==self.session:
-                if focus_target()!=self.session_buffer.target:
-                    self.session_buffer.target_changed()
-                outcome=self.session_buffer.complete(self.session)
-                if outcome=='buffered':
-                    self.status='本轮已暂存 · 右键托盘复制本轮输出';self.show(8)
-                elif outcome!='stale':
-                    self.status='已停止 · 麦克风已关闭';self.show(3)
+                if self.error or not self.draft.accepts(session):continue
+                text=message.get('text','')
+                if kind=='final':
+                    self.draft.append(session,text);self.preview=''
+                else:self.preview=text
+                shown,_=self.preferences.apply(self.draft.raw+self.preview)
+                self.editor.set_text(shown)
+            elif kind=='stopped' and not self.recording and self.draft.accepts(session):
+                shown,used=self.preferences.apply(self.draft.raw)
+                if self.draft.finish(session,shown,used):
+                    self.editor.set_text(shown);self.editor.editable(True)
+                    self.status='可编辑本轮全文 · 修改后点击复制'
+                    self.show()
             elif kind=='unloaded':
-                if not self.recording:self.preview='';self.status='模型内存已释放 · 等待 Caps Lock'
-            elif kind=='engine_phase' and message.get('step')=='model' and self.recording and not self.session_buffer.fallback:
-                self.status='● 正在加载本地模型 · 录音继续'
-                user.InvalidateRect(self.hwnd,None,False)
-            elif kind=='engine_phase' and message.get('step')=='loaded' and self.recording and not self.session_buffer.fallback:
-                self.status='● 正在录音 · Caps Lock 熄灭即停止'
-                user.InvalidateRect(self.hwnd,None,False)
+                if not self.draft.active:self.status='模型内存已释放 · 等待 Caps Lock'
+            elif kind=='engine_phase' and self.recording:
+                self.status='● 正在加载本地模型 · 录音继续' if message.get('step')=='model' else '● 正在录音 · 文字仅显示在这里'
+            elif kind=='preferences_saved':
+                if self.vocabulary.hwnd:self.vocabulary.refresh()
+            elif kind=='preferences_error':
+                self.status='文字已复制；偏好词库保存失败，请检查目录权限'
+                self.show()
             elif kind in ('error','worker_exited') and not self.closing:
                 self.error=True;self.stop()
-                self.status='识别进程异常，请从托盘退出后重新启动'
-                self.preview='未保存录音；未联网';self.show(10)
-        self.update_tray()
+                # Preserve confirmed speech for editing/copy even if the worker fails.
+                if self.draft.active and not self.draft.finished:
+                    shown,used=self.preferences.apply(self.draft.raw)
+                    self.draft.finish(self.session,shown,used);self.editor.set_text(shown);self.editor.editable(True)
+                self.status='识别异常 · 可复制已有文字，之后请退出重启';self.show()
+        user.InvalidateRect(self.hwnd,None,False);self.update_tray()
 
     def menu(self):
         menu=user.CreatePopupMenu()
         user.AppendMenuW(menu,1 if not self.ready else 0,101,'暂停 Caps Lock 输入' if self.enabled else '启用 Caps Lock 输入')
         user.AppendMenuW(menu,1 if self.recording else 0,102,'释放模型内存')
-        user.AppendMenuW(menu,1 if self.recording else 0,103,'开机自启：'+('已开启' if startup_enabled() else '已关闭'))
+        user.AppendMenuW(menu,0,103,'开机自启：'+('已开启' if startup_enabled() else '已关闭'))
         user.AppendMenuW(menu,0,104,'使用说明 / 隐私')
-        user.AppendMenuW(menu,0 if self.session_buffer.finished and self.session_buffer.text else 1,106,'复制本轮输出')
-        user.AppendMenuW(menu,0x800,0,None)
-        user.AppendMenuW(menu,0,105,'退出')
+        user.AppendMenuW(menu,0 if self.draft.active else 1,106,'显示本轮编辑窗口')
+        user.AppendMenuW(menu,0,107,'查看 / 管理偏好词库')
+        user.AppendMenuW(menu,0x800,0,None);user.AppendMenuW(menu,0,105,'退出')
         point=W.POINT();user.GetCursorPos(C.byref(point));user.SetForegroundWindow(self.hwnd)
         command=user.TrackPopupMenu(menu,0x100|0x2,point.x,point.y,0,self.hwnd,None)
         user.DestroyMenu(menu);user.PostMessageW(self.hwnd,0,0,0)
@@ -433,26 +415,18 @@ class App:
             except OSError:user.MessageBoxW(self.hwnd,'无法修改当前用户的开机启动项。',APP_NAME,0x10)
         elif command==104:
             user.MessageBoxW(self.hwnd,
-                'Caps Lock 亮起：录音；熄灭：停止。\n停顿后自动输入；目标切换或写入失败时，\n停止后只暂存；右键托盘“复制本轮输出”才复制。\n下一轮清空缓存及仍属于本程序的剪贴板内容。\n\n全部识别在本机完成，不保存录音。\n剪贴板带 Windows 禁同步、禁历史记录标记。\n文字粘贴到其他软件后由该软件处理。\n模型空闲 90 秒释放。\n\n右键托盘可暂停、自启开关或退出。',APP_NAME,0)
-        elif command==106:
-            if self.session_buffer.retry_copy(self.clipboard.write):
-                self.clipboard_copy_failed=False
-                self.status='本轮全部文字已复制 · 可按 Ctrl+V 粘贴';self.show(8)
-            else:
-                self.clipboard_copy_failed=True
-                self.status='剪贴板被占用 · 请稍后重试复制';self.show(8)
+                'Caps Lock 开灯录音、关灯停止。文字仅进入悬浮窗。\n停止并整理完成后可以编辑全文；支持拖动、缩放和滚动。\n点击复制确认本轮；点击取消或窗口关闭按钮丢弃本轮。\n已有草稿时先处理草稿再开始下一轮。\n\n复制后在本机后台比较修改，仅保存短词修正和少量上下文。\n首次只按上下文修正，同一修正确认三次后，多字词可通用。\n纯增删、数字和整段重写不学习；这不是模型训练。\n托盘可查看、删除、清空词库或暂停学习与修正。\n\n识别和词库处理全部本地完成，录音与全文不保存。\n剪贴板带 Windows 禁云同步、禁历史标记。',APP_NAME,0)
+        elif command==106:self.show()
+        elif command==107:self.vocabulary.open()
         elif command==105:user.DestroyWindow(self.hwnd)
 
     def paint(self):
         ps=PAINT();dc=user.BeginPaint(self.hwnd,C.byref(ps));rect=W.RECT()
         user.GetClientRect(self.hwnd,C.byref(rect))
         brush=gdi.CreateSolidBrush(0x00251B16);user.FillRect(dc,C.byref(rect),brush);gdi.DeleteObject(brush)
-        old=gdi.SelectObject(dc,self.font);gdi.SetBkMode(dc,1)
-        gdi.SetTextColor(dc,0x00C5EAA3 if self.recording else 0x00E6DFD3)
+        old=gdi.SelectObject(dc,self.font);gdi.SetBkMode(dc,1);gdi.SetTextColor(dc,0x00F8F7F4)
         user.DrawIconEx(dc,16,12,self.large_icon,24,24,0,None,3)
-        title=W.RECT(52,12,452,38);user.DrawTextW(dc,self.status,-1,C.byref(title),0x20|0x8000)
-        gdi.SetTextColor(dc,0x00F8F7F4)
-        body=W.RECT(18,48,452,126);user.DrawTextW(dc,self.preview,-1,C.byref(body),0x10|0x8000)
+        title=W.RECT(52,10,rect.right-12,42);user.DrawTextW(dc,self.status,-1,C.byref(title),0x20|0x8000)
         gdi.SelectObject(dc,old);user.EndPaint(self.hwnd,C.byref(ps))
 
     def window_proc(self, hwnd, message, wp, lp):
@@ -471,20 +445,24 @@ class App:
             if message==0xF:
                 if hasattr(self,'font'):self.paint();return 0
             if message==0x14:return 1
-            if message==0x21:return 3  # MA_NOACTIVATE: preview never steals the caret.
+            if message==0x24:
+                limits=C.cast(lp,C.POINTER(W.POINT))
+                limits[3].x=430;limits[3].y=320
+                return 0
+            if message==0x21 and (not self.draft.finished):return 3
+            if message==5 and self.editor:self.editor.layout();return 0
+            if message==0x111 and self.editor:
+                if (wp&0xFFFF)==202:self.copy_draft();return 0
+                if (wp&0xFFFF)==203:self.cancel_draft();return 0
+            if message==0x8004:user.DestroyWindow(hwnd);return 0
+            if message==0x8005:return int(self.recording)|(2 if self.draft.active else 0)
             if message==0x218 and wp in (4,7,18):  # suspend / resume
                 self.caps.reset();self.stop();return 1
             if message==0x113:
                 if wp==2:user.KillTimer(self.hwnd,2)
                 self.check_caps()
-                if self.recording and not self.session_buffer.fallback and focus_target()!=self.session_buffer.target:
-                    self.session_buffer.target_changed()
-                    self.status='目标已切换 · 本轮结果仅暂存'
-                    user.InvalidateRect(self.hwnd,None,False)
-                if self.hide_at and time.monotonic()>=self.hide_at and not self.recording:
-                    self.preview='';self.hide_at=0;user.ShowWindow(self.hwnd,0)
                 return 0
-            if message==0x10:user.DestroyWindow(hwnd);return 0
+            if message==0x10:self.cancel_draft();return 0
             if message==2:
                 self.close();user.PostQuitMessage(0);return 0
         except Exception:
@@ -492,6 +470,40 @@ class App:
             if hasattr(self,'status'):
                 self.status='本地输入发生错误，请退出后重试'
         return user.DefWindowProcW(hwnd,message,wp,lp)
+
+    def copy_draft(self):
+        if self.recording or not self.draft.active or not self.draft.finished:return
+        edited=self.editor.text()
+        if not edited.strip():
+            self.status='本轮内容为空，请输入文字或点击取消';self.show();return
+        if not self.clipboard.write(edited):
+            self.status='剪贴板被占用，请稍后重试；草稿已保留';self.show();return
+        original=self.draft.raw.replace('\r\n','\n')
+        normalized=edited.replace('\r\n','\n')
+        displayed=self.draft.displayed.replace('\r\n','\n')
+        try:self.learn_jobs.put_nowait((original,normalized,displayed,list(self.draft.used),self.preferences.revision))
+        except queue.Full:
+            self.status='文字已复制；本次未学习（后台任务繁忙）'
+        self.draft.cancel();self.editor.set_text('');self.editor.editable(False)
+        user.ShowWindow(self.hwnd,0)
+
+    def cancel_draft(self):
+        self.stop();self.draft.cancel();self.preview='';self.caps.reset()
+        self.editor.set_text('');self.editor.editable(False);user.ShowWindow(self.hwnd,0)
+        self.status='已取消本轮 · 等待 Caps Lock';self.update_tray()
+
+    def learn_preferences(self):
+        while True:
+            item=self.learn_jobs.get()
+            if item is None:return
+            try:
+                original,edited,displayed,used,revision=item
+                self.preferences.learn(original,edited,displayed,used,expected_revision=revision)
+                result={'kind':'preferences_saved'}
+            except Exception:result={'kind':'preferences_error'}
+            finally:
+                item=None;original=edited=displayed=used=None
+            self.inbox.put(result);user.PostMessageW(self.hwnd,WM_RESULT,0,0)
 
     def close(self):
         if self.closing:return
@@ -508,6 +520,11 @@ class App:
         if self.process:
             try:self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:self.process.terminate()
+        if self.vocabulary and self.vocabulary.hwnd:user.DestroyWindow(self.vocabulary.hwnd)
+        try:self.learn_jobs.put_nowait(None)
+        except queue.Full:pass
+        self.learning_thread.join(timeout=3)
+        if self.test_preferences:self.test_preferences.cleanup()
         if hasattr(self,'font'):gdi.DeleteObject(self.font)
         if hasattr(self,'small_icon'):user.DestroyIcon(self.small_icon)
         if hasattr(self,'large_icon'):user.DestroyIcon(self.large_icon)
@@ -515,6 +532,9 @@ class App:
     def run(self):
         msg=W.MSG()
         while user.GetMessageW(C.byref(msg),None,0,0)>0:
+            from floating_editor import u
+            if self.vocabulary.hwnd and u.IsDialogMessageW(self.vocabulary.hwnd,C.byref(msg)):continue
+            if u.IsDialogMessageW(self.hwnd,C.byref(msg)):continue
             user.TranslateMessage(C.byref(msg));user.DispatchMessageW(C.byref(msg))
 
 def main():

@@ -10,7 +10,7 @@
 int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR arguments,int) {
     if (wcscmp(arguments,L"--quit")==0) {
         HWND window=FindWindowW(L"CapshumeeWindow",L"卡输咪");
-        if(window) PostMessageW(window,WM_CLOSE,0,0);
+        if(window) PostMessageW(window,WM_APP+4,0,0);
         return 0;
     }
     wchar_t executable[MAX_PATH], system[MAX_PATH], command[2048];
